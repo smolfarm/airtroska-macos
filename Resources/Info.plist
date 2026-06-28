@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>Airtroska</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.airtroska.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Airtroska</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>6</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<!-- AirPlay device discovery on macOS 14/15+ requires local-network access; without
+	     this string the system denies it and the route picker finds no Apple TV / Roku. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Airtroska streams your video to an AirPlay device on your local network.</string>
+	<!-- AirPlay receivers advertise over Bonjour; declare the services we browse. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_airplay._tcp</string>
+		<string>_raop._tcp</string>
+	</array>
+	<!-- The receiver (and AVPlayer) fetch the video over plain HTTP from the Mac's LAN
+	     IP. App Transport Security blocks cleartext to routable IPs by default, so allow
+	     local networking. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

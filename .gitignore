@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# SwiftPM build artifacts
+.build/
+.swiftpm/
+
+# Assembled .app bundle (output of build.sh)
+build/
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+*.swp
+*.swo
+*~
+DerivedData/
+
+# Editors
+.vscode/
+.idea/
+
+# Claude Code session state
+.claude/
