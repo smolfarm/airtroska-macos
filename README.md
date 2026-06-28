@@ -61,6 +61,7 @@ Sources/Airtroska/
   AirtroskaApp.swift   entry point / window
   ContentView.swift     drop zone + progress + error handling
   Remuxer.swift        ffprobe probe, conversion-kind decision, ffmpeg run
+  ConversionCache.swift  reuses converted MP4s so re-opening a file skips ffmpeg
   PlayerView.swift     AVPlayer with AirPlay route picker
   LocalHTTPServer.swift  byte-range HTTP server for non-Apple receivers
 Resources/Info.plist   AirPlay / local-network entitlements

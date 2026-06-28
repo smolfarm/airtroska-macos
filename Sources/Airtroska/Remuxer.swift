@@ -138,6 +138,19 @@ final class Remuxer: ObservableObject {
     /// Convert `input` to an AirPlay-friendly MP4 in a temp dir. Returns the new URL.
     func convert(_ input: URL) async throws -> URL {
         guard let ffmpeg = Self.ffmpeg else { throw ConversionError.noFFmpeg }
+
+        // Reuse a previous conversion of this exact file instead of running ffmpeg again.
+        if let cached = ConversionCache.cachedURL(for: input) {
+            ConversionCache.markUsed(cached)
+            dbg("cache hit -> \(cached.lastPathComponent)")
+            await MainActor.run {
+                self.status = "Loaded from cache"
+                self.progress = 1
+                self.isWorking = false
+            }
+            return cached
+        }
+
         let probe = try await self.probe(input)
         let kind = self.kind(for: probe)
         let outURL = FileManager.default.temporaryDirectory
@@ -207,8 +220,12 @@ final class Remuxer: ObservableObject {
             throw ConversionError.ffmpegFailed(tail.suffix(400).description)
         }
         guard FileManager.default.fileExists(atPath: outURL.path) else { throw ConversionError.noOutput }
+        // Promote the finished temp file into the cache (atomic move). Fall back to the temp
+        // file if it couldn't be stored, so playback still works.
+        let finalURL = ConversionCache.store(outURL, for: input) ?? outURL
         await MainActor.run { self.progress = 1 }
-        return outURL
+        dbg("convert ok (cached=\(ConversionCache.contains(finalURL))) -> \(finalURL.lastPathComponent)")
+        return finalURL
     }
 
     func cancel() {
