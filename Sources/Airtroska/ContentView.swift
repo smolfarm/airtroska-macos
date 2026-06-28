@@ -10,12 +10,21 @@ struct ContentView: View {
 
     private let acceptedExtensions: Set<String> = ["mkv", "mp4", "m4v", "mov", "avi"]
 
+    /// What the player header shows: the dropped file's name (without extension), not the
+    /// `airtroska-<uuid>.mp4` temp file the converter actually produced.
+    private var displayTitle: String {
+        if let sourceName {
+            return URL(fileURLWithPath: sourceName).deletingPathExtension().lastPathComponent
+        }
+        return convertedURL?.deletingPathExtension().lastPathComponent ?? "Video"
+    }
+
     var body: some View {
         ZStack {
             Color(NSColor.windowBackgroundColor).ignoresSafeArea()
 
             if let url = convertedURL {
-                PlayerView(url: url) {
+                PlayerView(url: url, title: displayTitle) {
                     cleanup()
                 }
                 .transition(.opacity)
@@ -144,7 +153,9 @@ struct ContentView: View {
     }
 
     private func cleanup() {
-        if let url = convertedURL {
+        // Leave cached conversions in place so re-opening the same file is instant; only
+        // remove an uncached temp output (e.g. if caching failed).
+        if let url = convertedURL, !ConversionCache.contains(url) {
             try? FileManager.default.removeItem(at: url)
         }
         convertedURL = nil
