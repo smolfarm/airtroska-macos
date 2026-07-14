@@ -20,17 +20,28 @@ final class PlayerController: ObservableObject {
     /// Set by the scrubber while the user drags so the periodic observer doesn't fight it.
     var isScrubbing = false
 
+    /// Called (on main) when the current item plays to its end — drives playlist auto-advance.
+    var onItemEnded: (() -> Void)?
+
     private var server: LocalHTTPServer?
     private var observations: [NSKeyValueObservation] = []
     private var timeObserver: Any?
     private var routeDetector: AVRouteDetector?
+    private var endObserver: NSObjectProtocol?
 
     init() {
         player.allowsExternalPlayback = true   // let AirPlay carry the video to a TV
         player.actionAtItemEnd = .pause
     }
 
+    /// Load and play `url`. Safe to call again with a new URL (playlist advance): the
+    /// previous item's server and observers are torn down, but the AVPlayer itself is
+    /// kept so an active AirPlay route carries over to the next video.
     func start(url: URL) {
+        teardownItem()
+        currentTime = 0
+        duration = 0
+
         // Serve over HTTP on the Mac's LAN IP. A non-Apple AirPlay receiver (e.g. a Roku)
         // can't be handed a file:// asset — it must fetch the video from a URL it can reach.
         let playURL: URL
@@ -67,6 +78,14 @@ final class PlayerController: ObservableObject {
             }
         })
 
+        // End-of-item drives playlist auto-advance.
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
+        ) { [weak self] _ in
+            dbg("item played to end")
+            self?.onItemEnded?()
+        }
+
         // Periodic clock for the scrubber (4×/sec), delivered on the main queue.
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
@@ -84,12 +103,24 @@ final class PlayerController: ObservableObject {
         // does the same internally. (We deliberately do NOT bind `multipleRoutesDetected` to
         // the UI: testing showed it stays false even while a route is in active use, so it's
         // useless as an availability signal. We keep the detector only for its discovery.)
-        let detector = AVRouteDetector()
-        detector.isRouteDetectionEnabled = true
-        routeDetector = detector
+        if routeDetector == nil {
+            let detector = AVRouteDetector()
+            detector.isRouteDetectionEnabled = true
+            routeDetector = detector
+        }
 
         player.play()
         dbg("player setup, play() called for \(url.lastPathComponent)")
+    }
+
+    /// Undo everything `start(url:)` set up for the current item, leaving the player and
+    /// route detector alone so playback can move to another item seamlessly.
+    private func teardownItem() {
+        if let t = timeObserver { player.removeTimeObserver(t); timeObserver = nil }
+        observations.removeAll()              // invalidate KVO before tearing down its targets
+        if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
+        server?.stop()
+        server = nil
     }
 
     func togglePlay() {
@@ -103,12 +134,9 @@ final class PlayerController: ObservableObject {
 
     func stop() {
         player.pause()
-        if let t = timeObserver { player.removeTimeObserver(t); timeObserver = nil }
-        observations.removeAll()              // invalidate KVO before tearing down its targets
+        teardownItem()
         routeDetector?.isRouteDetectionEnabled = false
         routeDetector = nil
-        server?.stop()
-        server = nil
         player.replaceCurrentItem(with: nil)
     }
 }
@@ -188,82 +216,215 @@ private struct AirPlayControl: View {
 }
 
 /// Shows the converted MP4 in a native AVPlayer with a single, enhanced AirPlay control.
+/// When the playlist has more than one item it also offers prev/next transport buttons
+/// and a toggleable queue sidebar.
 struct PlayerView: View {
     let url: URL
     let title: String
+    var playlist: [PlaylistItem] = []
+    var currentIndex: Int = 0
+    /// Jump to a playlist item (converting it first if needed).
+    var onSelect: ((Int) -> Void)? = nil
+    /// The current video played to its end.
+    var onEnded: (() -> Void)? = nil
     let onClose: () -> Void
 
     @StateObject private var controller = PlayerController()
+    @State private var showPlaylist = true
+
+    private var hasPlaylist: Bool { playlist.count > 1 }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header: title • AirPlay • close
-            HStack(spacing: 12) {
-                Text(title)
-                    .font(.headline)
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                header
+                // Video. AVPlayerView shows its own "playing on TV" message when external
+                // playback is active, so we don't draw our own overlay (it would collide).
+                ZStack {
+                    Color.black
+                    PlayerSurface(player: controller.player)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                transport
+            }
+
+            if hasPlaylist && showPlaylist {
+                Divider()
+                playlistPanel
+            }
+        }
+        .onAppear {
+            controller.onItemEnded = onEnded
+            controller.start(url: url)
+        }
+        // Playlist advance swaps the URL in place; reload on the same controller so an
+        // active AirPlay route carries over to the next video.
+        .onChange(of: url) { newURL in
+            controller.onItemEnded = onEnded
+            controller.start(url: newURL)
+        }
+        .onDisappear { controller.stop() }
+    }
+
+    // Header: title • AirPlay • playlist toggle • close
+    private var header: some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if hasPlaylist {
+                Text("\(currentIndex + 1) of \(playlist.count)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 12)
+            AirPlayControl(controller: controller)
+            if hasPlaylist {
+                Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showPlaylist.toggle() } }) {
+                    Image(systemName: "list.bullet")
+                        .font(.title3)
+                        .foregroundStyle(showPlaylist ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(showPlaylist ? "Hide playlist" : "Show playlist")
+            }
+            Button(action: onClose) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Close")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial)
+    }
+
+    // Transport: (prev) play/pause (next) • elapsed • scrubber • duration
+    private var transport: some View {
+        HStack(spacing: 12) {
+            if hasPlaylist {
+                Button(action: { onSelect?(currentIndex - 1) }) {
+                    Image(systemName: "backward.end.fill")
+                        .frame(width: 18)
+                }
+                .buttonStyle(.plain)
+                .disabled(currentIndex == 0)
+                .help("Previous")
+            }
+
+            Button(action: controller.togglePlay) {
+                Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.title3)
+                    .frame(width: 22)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.space, modifiers: [])
+            .help(controller.isPlaying ? "Pause" : "Play")
+
+            if hasPlaylist {
+                Button(action: { onSelect?(currentIndex + 1) }) {
+                    Image(systemName: "forward.end.fill")
+                        .frame(width: 18)
+                }
+                .buttonStyle(.plain)
+                .disabled(currentIndex + 1 >= playlist.count)
+                .help("Next")
+            }
+
+            Text(timeString(controller.currentTime))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Slider(
+                value: $controller.currentTime,
+                in: 0...max(controller.duration, 1),
+                onEditingChanged: { editing in
+                    if editing {
+                        controller.isScrubbing = true
+                    } else {
+                        controller.seek(to: controller.currentTime)
+                        controller.isScrubbing = false
+                    }
+                }
+            )
+            .disabled(controller.duration <= 0)
+
+            Text(timeString(controller.duration))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.regularMaterial)
+    }
+
+    private var playlistPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Playlist")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+            Divider()
+            ScrollView {
+                VStack(spacing: 1) {
+                    ForEach(Array(playlist.enumerated()), id: \.element.id) { i, item in
+                        playlistRow(i, item)
+                    }
+                }
+                .padding(6)
+            }
+        }
+        .frame(width: 240)
+        .background(.regularMaterial)
+    }
+
+    private func playlistRow(_ i: Int, _ item: PlaylistItem) -> some View {
+        Button(action: { if i != currentIndex { onSelect?(i) } }) {
+            HStack(spacing: 8) {
+                Group {
+                    if i == currentIndex {
+                        Image(systemName: "play.fill")
+                            .foregroundStyle(Color.accentColor)
+                    } else if item.failed != nil {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("\(i + 1)")
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .font(.caption.monospacedDigit())
+                .frame(width: 18)
+
+                Text(item.displayName)
+                    .font(.callout)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer(minLength: 12)
-                AirPlayControl(controller: controller)
-                Button(action: onClose) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
+                    .foregroundStyle(i == currentIndex ? Color.accentColor : Color.primary)
+
+                Spacer(minLength: 0)
+
+                // Already converted — jumping here is instant.
+                if item.readyURL != nil && i != currentIndex {
+                    Image(systemName: "checkmark")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
-                .buttonStyle(.plain)
-                .help("Close")
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(.regularMaterial)
-
-            // Video. AVPlayerView shows its own "playing on TV" message when external
-            // playback is active, so we don't draw our own overlay (it would collide).
-            ZStack {
-                Color.black
-                PlayerSurface(player: controller.player)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            // Transport: play/pause • elapsed • scrubber • duration
-            HStack(spacing: 12) {
-                Button(action: controller.togglePlay) {
-                    Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.title3)
-                        .frame(width: 22)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.space, modifiers: [])
-                .help(controller.isPlaying ? "Pause" : "Play")
-
-                Text(timeString(controller.currentTime))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-
-                Slider(
-                    value: $controller.currentTime,
-                    in: 0...max(controller.duration, 1),
-                    onEditingChanged: { editing in
-                        if editing {
-                            controller.isScrubbing = true
-                        } else {
-                            controller.seek(to: controller.currentTime)
-                            controller.isScrubbing = false
-                        }
-                    }
-                )
-                .disabled(controller.duration <= 0)
-
-                Text(timeString(controller.duration))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.regularMaterial)
+            .padding(.vertical, 5)
+            .padding(.horizontal, 8)
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(i == currentIndex ? Color.accentColor.opacity(0.12) : Color.clear)
+            )
         }
-        .onAppear { controller.start(url: url) }
-        .onDisappear { controller.stop() }
+        .buttonStyle(.plain)
+        .help(item.failed ?? item.sourceURL.lastPathComponent)
     }
 
     private func timeString(_ s: Double) -> String {

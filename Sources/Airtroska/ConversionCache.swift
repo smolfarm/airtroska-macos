@@ -9,7 +9,7 @@ import CryptoKit
 enum ConversionCache {
     /// Bump when the conversion pipeline changes (codecs, flags, tags) so previously cached
     /// outputs are treated as misses instead of serving stale results.
-    static let version = 1
+    static let version = 2
 
     /// Soft cap on total cache size; least-recently-used files are evicted past this.
     static let maxBytes: UInt64 = 10_000_000_000   // 10 GB
@@ -26,23 +26,25 @@ enum ConversionCache {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
-    /// Stable, filesystem-safe key from the source's path + size + modification time.
-    private static func key(for input: URL) -> String? {
+    /// Stable, filesystem-safe key from the source's path + size + modification time, plus a
+    /// `variant` describing which subtitle track (if any) was burned in. Two conversions of the
+    /// same source with different subtitle choices must NOT collide in the cache.
+    private static func key(for input: URL, variant: String) -> String? {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: input.path) else { return nil }
         let size = (attrs[.size] as? UInt64) ?? 0
         let mtime = Int((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
-        let raw = "v\(version)|\(input.path)|\(size)|\(mtime)"
+        let raw = "v\(version)|\(input.path)|\(size)|\(mtime)|\(variant)"
         let digest = SHA256.hash(data: Data(raw.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func fileURL(for input: URL) -> URL? {
-        key(for: input).map { directory.appendingPathComponent("\($0).mp4") }
+    private static func fileURL(for input: URL, variant: String) -> URL? {
+        key(for: input, variant: variant).map { directory.appendingPathComponent("\($0).mp4") }
     }
 
-    /// The cached conversion for `input`, if a non-empty one exists.
-    static func cachedURL(for input: URL) -> URL? {
-        guard let url = fileURL(for: input) else { return nil }
+    /// The cached conversion for `input`+`variant`, if a non-empty one exists.
+    static func cachedURL(for input: URL, variant: String) -> URL? {
+        guard let url = fileURL(for: input, variant: variant) else { return nil }
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? nil
         return (size ?? 0) > 0 ? url : nil
     }
@@ -59,8 +61,8 @@ enum ConversionCache {
 
     /// Move a freshly-converted temp file into the cache. Returns the cached URL, or nil if
     /// it couldn't be stored (caller should fall back to the temp file).
-    static func store(_ tempURL: URL, for input: URL) -> URL? {
-        guard let dest = fileURL(for: input) else { return nil }
+    static func store(_ tempURL: URL, for input: URL, variant: String) -> URL? {
+        guard let dest = fileURL(for: input, variant: variant) else { return nil }
         ensureDirectory()
         let fm = FileManager.default
         do {

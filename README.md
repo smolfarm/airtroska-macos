@@ -49,9 +49,19 @@ assembled bundle in `build/` is a build artifact and is git-ignored.
 
 1. Launch Airtroska.
 2. Drag a `.mkv` / `.mp4` / `.m4v` / `.mov` / `.avi` onto the window.
-3. Wait for the progress bar — "Copying video, converting audio" is fast;
+3. If the file has subtitle streams, a picker appears first: choose a track to
+   **burn in**, or "No subtitles" to skip. Burn-in renders the track into the
+   video so it actually shows up on the TV over AirPlay (soft/selectable
+   subtitles are unreliable over AirPlay and are dropped). Burning in forces a
+   video transcode, so it's slower than "No subtitles" (which keeps the fast
+   copy path). Image subtitle tracks (PGS) burn via ffmpeg's `overlay` filter;
+   text tracks (SRT/ASS/SSA) burn via the libass `subtitles` filter, so an
+   ffmpeg built with libass is required for those — the standard
+   `brew install ffmpeg` includes it. If yours doesn't, the picker disables the
+   text tracks and tells you.
+4. Wait for the progress bar — "Copying video, converting audio" is fast;
    "Transcoding to H.264" is not.
-4. The converted MP4 opens in an AVPlayer. Use the AirPlay button to pick your
+5. The converted MP4 opens in an AVPlayer. Use the AirPlay button to pick your
    Apple TV.
 
 ## Project layout
