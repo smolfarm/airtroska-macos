@@ -27,7 +27,7 @@ final class PlayerController: ObservableObject {
     private var observations: [NSKeyValueObservation] = []
     private var timeObserver: Any?
     private var routeDetector: AVRouteDetector?
-    private var endObserver: NSObjectProtocol?
+    private var itemObservers: [NSObjectProtocol] = []
 
     init() {
         player.allowsExternalPlayback = true   // let AirPlay carry the video to a TV
@@ -67,7 +67,9 @@ final class PlayerController: ObservableObject {
         })
         observations.append(player.observe(\.timeControlStatus, options: [.new]) { [weak self] pl, _ in
             DispatchQueue.main.async {
-                dbg("timeControlStatus=\(pl.timeControlStatus.rawValue) (0=paused 1=waiting 2=playing)")
+                let waiting = pl.reasonForWaitingToPlay.map { " waiting for: \($0.rawValue)" } ?? ""
+                dbg("timeControlStatus=\(pl.timeControlStatus.rawValue) (0=paused 1=waiting 2=playing)"
+                    + " t=\(String(format: "%.1f", pl.currentTime().seconds))\(waiting)")
                 self?.isPlaying = (pl.timeControlStatus == .playing)
             }
         })
@@ -79,12 +81,34 @@ final class PlayerController: ObservableObject {
         })
 
         // End-of-item drives playlist auto-advance.
-        endObserver = NotificationCenter.default.addObserver(
+        let center = NotificationCenter.default
+        itemObservers.append(center.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
-            dbg("item played to end")
+            dbg("item played to end at t=\(String(format: "%.1f", item.currentTime().seconds))"
+                + " of \(String(format: "%.1f", item.duration.seconds))"
+                + " external=\(self?.player.isExternalPlaybackActive == true)")
             self?.onItemEnded?()
-        }
+        })
+        // Diagnostics: how playback goes wrong, especially on an AirPlay receiver.
+        itemObservers.append(center.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main
+        ) { note in
+            let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+            dbg("item failed to play to end: \(String(describing: error))")
+        })
+        itemObservers.append(center.addObserver(
+            forName: .AVPlayerItemPlaybackStalled, object: item, queue: .main
+        ) { _ in
+            dbg("item stalled at t=\(String(format: "%.1f", item.currentTime().seconds))")
+        })
+        itemObservers.append(center.addObserver(
+            forName: .AVPlayerItemNewErrorLogEntry, object: item, queue: .main
+        ) { _ in
+            guard let e = item.errorLog()?.events.last else { return }
+            dbg("item error log: \(e.errorDomain) \(e.errorStatusCode) \(e.errorComment ?? "")"
+                + " uri=\(e.uri ?? "-")")
+        })
 
         // Periodic clock for the scrubber (4×/sec), delivered on the main queue.
         timeObserver = player.addPeriodicTimeObserver(
@@ -118,7 +142,8 @@ final class PlayerController: ObservableObject {
     private func teardownItem() {
         if let t = timeObserver { player.removeTimeObserver(t); timeObserver = nil }
         observations.removeAll()              // invalidate KVO before tearing down its targets
-        if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
+        itemObservers.forEach(NotificationCenter.default.removeObserver)
+        itemObservers.removeAll()
         server?.stop()
         server = nil
     }
@@ -315,6 +340,15 @@ struct PlayerView: View {
                 .help("Previous")
             }
 
+            Button(action: { skip(by: -10) }) {
+                Image(systemName: "gobackward.10")
+                    .frame(width: 18)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.leftArrow, modifiers: [])
+            .disabled(controller.duration <= 0)
+            .help("Back 10 seconds (←)")
+
             Button(action: controller.togglePlay) {
                 Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
                     .font(.title3)
@@ -323,6 +357,15 @@ struct PlayerView: View {
             .buttonStyle(.plain)
             .keyboardShortcut(.space, modifiers: [])
             .help(controller.isPlaying ? "Pause" : "Play")
+
+            Button(action: { skip(by: 10) }) {
+                Image(systemName: "goforward.10")
+                    .frame(width: 18)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.rightArrow, modifiers: [])
+            .disabled(controller.duration <= 0)
+            .help("Forward 10 seconds (→)")
 
             if hasPlaylist {
                 Button(action: { onSelect?(currentIndex + 1) }) {
@@ -425,6 +468,12 @@ struct PlayerView: View {
         }
         .buttonStyle(.plain)
         .help(item.failed ?? item.sourceURL.lastPathComponent)
+    }
+
+    private func skip(by seconds: Double) {
+        let target = min(max(controller.currentTime + seconds, 0),
+                         max(controller.duration - 0.5, 0))
+        controller.seek(to: target)
     }
 
     private func timeString(_ s: Double) -> String {

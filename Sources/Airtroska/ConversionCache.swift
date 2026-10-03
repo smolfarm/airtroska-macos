@@ -9,10 +9,11 @@ import CryptoKit
 enum ConversionCache {
     /// Bump when the conversion pipeline changes (codecs, flags, tags) so previously cached
     /// outputs are treated as misses instead of serving stale results.
-    static let version = 2
+    static let version = 3
 
     /// Soft cap on total cache size; least-recently-used files are evicted past this.
-    static let maxBytes: UInt64 = 10_000_000_000   // 10 GB
+    /// User-configurable in Settings → Cache (defaults to 10 GB).
+    static var maxBytes: UInt64 { Prefs.cacheLimitBytes }
 
     /// `…/Caches/Airtroska/ConvertedMedia` (not created by this getter — see `ensureDirectory`).
     static var directory: URL {
@@ -75,6 +76,27 @@ enum ConversionCache {
         evictIfNeeded()
         return dest
     }
+
+    /// Total size of everything in the cache, for the Settings window's usage readout.
+    static func totalBytes() -> UInt64 {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: directory,
+                                                      includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        return items.reduce(UInt64(0)) {
+            $0 + UInt64((try? $1.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+    }
+
+    /// Delete every cached conversion (Settings → Cache → Clear Converted Files).
+    static func clear() {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: directory,
+                                                      includingPropertiesForKeys: nil) else { return }
+        for url in items { try? fm.removeItem(at: url) }
+    }
+
+    /// Re-run eviction now (e.g. after the user lowers the size limit in Settings).
+    static func enforceLimit() { evictIfNeeded() }
 
     /// Evict least-recently-used files until the total size is under `maxBytes`.
     private static func evictIfNeeded() {

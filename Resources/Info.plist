@@ -13,11 +13,80 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>7</string>
+	<key>CFBundleIconFile</key>
+	<string>Airtroska</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.video</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT License</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<!-- Register as a viewer for common video types so Finder's "Open With", dock-icon
+	     drops, and `open -a Airtroska file.mkv` all work. Rank is Alternate: we never
+	     want to steal the double-click default from real players. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Video</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.matroska.mkv</string>
+				<string>org.webmproject.webm</string>
+				<string>public.mpeg-4</string>
+				<string>com.apple.m4v-video</string>
+				<string>com.apple.quicktime-movie</string>
+				<string>public.avi</string>
+				<string>public.mpeg</string>
+			</array>
+		</dict>
+	</array>
+	<!-- MKV and WebM have no system-declared UTIs; import them so the doc types above
+	     (and NSOpenPanel filtering) can reference them. -->
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>org.matroska.mkv</string>
+			<key>UTTypeDescription</key>
+			<string>Matroska Video</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.movie</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>mkv</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>org.webmproject.webm</string>
+			<key>UTTypeDescription</key>
+			<string>WebM Video</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.movie</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>webm</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

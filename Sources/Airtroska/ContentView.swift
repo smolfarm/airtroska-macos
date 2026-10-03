@@ -33,8 +33,6 @@ struct ContentView: View {
     /// The picker's current selection: `nil` = "No subtitles", else a track's relative index.
     @State private var selectedSubtitleIndex: Int? = nil
 
-    private let acceptedExtensions: Set<String> = ["mkv", "mp4", "m4v", "mov", "avi"]
-
     var body: some View {
         ZStack {
             Color(NSColor.windowBackgroundColor).ignoresSafeArea()
@@ -72,6 +70,25 @@ struct ContentView: View {
         .sheet(item: $subtitlePicker) { model in
             subtitlePickerSheet(model)
         }
+        // Files arriving from outside the window: Finder "Open With", dock drops, and
+        // File ▸ Open… all funnel through OpenedFiles. They replace any current session.
+        .onReceive(OpenedFiles.shared.$urls) { urls in
+            guard !urls.isEmpty else { return }
+            OpenedFiles.shared.urls = []
+            openExternal(urls)
+        }
+    }
+
+    private func openExternal(_ urls: [URL]) {
+        dbg("openExternal: \(urls.count) file(s)")
+        let accepted = urls.filter { Media.acceptedExtensions.contains($0.pathExtension.lowercased()) }
+        guard !accepted.isEmpty else {
+            error = "None of those files look like videos Airtroska can convert."
+            return
+        }
+        subtitlePicker = nil
+        endSession()
+        startPlaylist(accepted)
     }
 
     /// Lets the user pick a subtitle track to burn in (or none). "No subtitles" is the
@@ -231,7 +248,7 @@ struct ContentView: View {
                 .foregroundStyle(.tint)
 
             VStack(spacing: 6) {
-                Text("Drop .mkv files here")
+                Text("Drop video files here")
                     .font(.title2.weight(.semibold))
                 Text("They'll be converted to AirPlay-friendly MP4, then you pick your Apple TV. "
                      + "Drop several at once to queue them up as a playlist.")
@@ -240,6 +257,9 @@ struct ContentView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 40)
             }
+
+            Button("Choose Files…") { AirtroskaApp.presentOpenPanel() }
+                .help("Or drag files from Finder, or use File ▸ Open (⌘O)")
 
             if Remuxer.ffmpeg == nil {
                 Label("ffmpeg not found — install with `brew install ffmpeg`",
@@ -299,10 +319,10 @@ struct ContentView: View {
         }
         group.notify(queue: .main) {
             let urls = loaded.sorted { $0.order < $1.order }.map(\.url)
-            let accepted = urls.filter { acceptedExtensions.contains($0.pathExtension.lowercased()) }
+            let accepted = urls.filter { Media.acceptedExtensions.contains($0.pathExtension.lowercased()) }
             guard !accepted.isEmpty else {
                 self.error = urls.isEmpty ? "Couldn't read the dropped files."
-                                          : "Drop .mkv files (or .mp4/.mov/.m4v/.avi)."
+                                          : "Drop video files (.mkv, .mp4, .mov, .avi, .webm, …)."
                 return
             }
             if accepted.count < urls.count {
@@ -340,8 +360,9 @@ struct ContentView: View {
 
         do {
             let probe = try await remuxer.probe(url)
-            if probe.subtitles.isEmpty {
-                // No subtitles → no choice to make; convert straight away on the fast path.
+            if probe.subtitles.isEmpty || Prefs.subtitleMode == .never {
+                // No subtitles (or the user opted out of the question in Settings) → no
+                // choice to make; convert straight away on the fast path.
                 await finishConvert(playlist[index], subtitle: nil)
             } else {
                 // Defer conversion until the user picks a track (or none).
@@ -434,8 +455,14 @@ struct ContentView: View {
     }
 }
 
+private let dbgTimeFormat: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "HH:mm:ss.SSS"
+    return f
+}()
+
 func dbg(_ s: String) {
-    let line = "[airtroska] \(s)\n"
+    let line = "[airtroska \(dbgTimeFormat.string(from: Date()))] \(s)\n"
     fputs(line, stderr)
     let path = "/tmp/airtroska.log"
     if !FileManager.default.fileExists(atPath: path) {

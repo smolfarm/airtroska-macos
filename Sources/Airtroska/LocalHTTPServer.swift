@@ -1,17 +1,52 @@
 import Foundation
 import Network
 
-/// A tiny HTTP server that serves a single file with byte-range support.
+/// A tiny HTTP/1.1 server that serves a single file with byte-range support.
 ///
-/// AirPlay to a third-party receiver (e.g. a Roku TV) needs the receiver to fetch
+/// AirPlay to a third-party receiver (e.g. a Roku or Vizio TV) needs the receiver to fetch
 /// the media from a URL it can reach — a `file://` asset can't be handed off, so the
 /// receiver sits on the splash. We serve the converted MP4 on the Mac's LAN IP and
 /// give AVPlayer that `http://` URL instead.
+///
+/// A TV's media player is less forgiving than AVFoundation: it may probe with `HEAD`, ask
+/// for suffix ranges (`bytes=-N`), and reuse one connection for many range requests. Those
+/// mistakes tend to surface as endless re-buffering on the TV rather than a clean error, so
+/// the server handles all of them the way a real file server would.
 final class LocalHTTPServer {
     private var listener: NWListener?
     private let fileURL: URL
     private let size: UInt64
     private(set) var port: UInt16 = 0
+
+    /// All socket I/O runs on this serial queue, so per-connection state needs no locking.
+    private let queue = DispatchQueue(label: "airtroska.http")
+    /// Open connections (queue-confined), so `stop()` can close keep-alive sockets the
+    /// receiver left idle instead of leaking them.
+    private var clients: [ObjectIdentifier: Client] = [:]
+    /// Numbers connections in the log so a receiver's requests can be told apart.
+    private var nextClientID = 0
+
+    /// One connection's state (queue-confined). Exactly one `receive` is outstanding for the
+    /// connection's whole life — including while a response body is going out — so a
+    /// request the client pipelines, or the client hanging up, is seen as it happens rather
+    /// than sitting unread in the socket until the body is done.
+    private final class Client {
+        let id: Int
+        let conn: NWConnection
+        /// Received bytes not yet parsed into a request.
+        var inbox = Data()
+        /// A response is being sent.
+        var busy = false
+        /// The client finished sending (FIN) or the receive failed.
+        var peerClosed = false
+        init(id: Int, conn: NWConnection) { self.id = id; self.conn = conn }
+    }
+
+    private static let chunkSize = 1_048_576 // 1 MB
+    /// Log a body's progress every this many bytes.
+    private static let reportEvery: UInt64 = 16 * 1_048_576
+    private static let maxHeadBytes = 64 * 1024
+    private static let headTerminator = Data("\r\n\r\n".utf8)
 
     init(fileURL: URL) throws {
         self.fileURL = fileURL
@@ -28,11 +63,10 @@ final class LocalHTTPServer {
     }
 
     func start() throws {
-        let params = NWParameters.tcp
-        let listener = try NWListener(using: params, on: .any)
+        let listener = try NWListener(using: .tcp, on: .any)
         let sem = DispatchSemaphore(value: 0)
         listener.newConnectionHandler = { [weak self] conn in
-            self?.handle(conn)
+            self?.accept(conn)
         }
         listener.stateUpdateHandler = { [weak self] state in
             if case .ready = state {
@@ -42,7 +76,7 @@ final class LocalHTTPServer {
                 sem.signal()
             }
         }
-        listener.start(queue: .global())
+        listener.start(queue: queue)
         self.listener = listener
         _ = sem.wait(timeout: .now() + 2)
     }
@@ -50,107 +84,230 @@ final class LocalHTTPServer {
     func stop() {
         listener?.cancel()
         listener = nil
+        queue.async { [self] in
+            for client in clients.values { client.conn.cancel() }
+            clients.removeAll()
+        }
     }
 
     // MARK: - Per-connection
 
-    private func handle(_ conn: NWConnection) {
-        conn.start(queue: .global())
-        receiveRequest(conn) { request in
-            self.respond(conn, request: request)
+    private func accept(_ conn: NWConnection) {
+        nextClientID += 1
+        let client = Client(id: nextClientID, conn: conn)
+        let key = ObjectIdentifier(conn)
+        let id = client.id
+        clients[key] = client
+        dbg("http #\(id) open from \(conn.endpoint)")
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed(let error):
+                dbg("http #\(id) failed: \(error)")
+                self?.clients[key] = nil
+            case .cancelled:
+                dbg("http #\(id) closed")
+                self?.clients[key] = nil
+            default: break
+            }
+        }
+        conn.start(queue: queue)
+        receive(client)
+    }
+
+    /// The connection's single outstanding receive; re-arms itself until the client stops
+    /// sending. A request head can span several TCP segments, so bytes accumulate in the
+    /// inbox until `serveNext` finds a whole one.
+    private func receive(_ client: Client) {
+        client.conn.receive(minimumIncompleteLength: 1, maximumLength: Self.maxHeadBytes) { data, _, isComplete, error in
+            if let data, !data.isEmpty {
+                if client.busy {
+                    let firstLine = String(decoding: data.prefix(120), as: UTF8.self)
+                        .components(separatedBy: "\r\n").first ?? ""
+                    dbg("http #\(client.id) sent \(data.count) bytes before the current response finished: \(firstLine)")
+                }
+                client.inbox += data
+            }
+            if isComplete || error != nil {
+                client.peerClosed = true
+                let how = error.map { "receive failed: \($0)" } ?? "client finished sending"
+                dbg("http #\(client.id) \(how)\(client.busy ? " (mid-response)" : "")")
+                // A request that arrived along with the FIN still gets its answer; otherwise
+                // there's nothing left to do. A response in flight finishes or fails on its own.
+                self.serveNext(client)
+                if !client.busy { client.conn.cancel() }
+                return
+            }
+            guard client.inbox.count < Self.maxHeadBytes else { client.conn.cancel(); return }
+            self.serveNext(client)
+            self.receive(client)
         }
     }
 
-    private func receiveRequest(_ conn: NWConnection, completion: @escaping (String) -> Void) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, _ in
-            if let data, let s = String(data: data, encoding: .utf8) {
-                completion(s)
-            } else if isComplete {
-                completion("")
+    /// If no response is in flight and a whole request head (`\r\n\r\n`) is buffered, answer
+    /// it. On a keep-alive connection, look for the next request once it's done.
+    private func serveNext(_ client: Client) {
+        guard !client.busy, let end = client.inbox.range(of: Self.headTerminator) else { return }
+        let head = String(decoding: client.inbox[..<end.lowerBound], as: UTF8.self)
+        client.inbox.removeSubrange(..<end.upperBound)
+        client.busy = true
+        respond(client, head: head) { keepAlive in
+            client.busy = false
+            if keepAlive && !client.peerClosed {
+                self.serveNext(client)
             } else {
-                conn.cancel()
+                // Flush, send FIN, then tear down.
+                client.conn.send(content: nil, contentContext: .finalMessage, isComplete: true,
+                                 completion: .contentProcessed { _ in client.conn.cancel() })
             }
         }
     }
 
-    private func respond(_ conn: NWConnection, request: String) {
-        guard request.hasPrefix("GET") else { conn.cancel(); return }
-        let range = parseRange(in: request)
-        dbg("HTTP \(request.split(separator: "\r\n").first.map(String.init) ?? "?") range=\(range.map { "\($0.0)-\($0.1)" } ?? "none")")
-
-        let (start, end, status) = resolve(range: range)
-        let length = end - start + 1
-
-        var head = "HTTP/1.1 \(status)\r\n"
-        head += "Content-Type: video/mp4\r\n"
-        head += "Accept-Ranges: bytes\r\n"
-        if status == "206 Partial Content" {
-            head += "Content-Range: bytes \(start)-\(end)/\(size)\r\n"
+    /// Send the response for one request, then call `done` with whether the connection
+    /// should stay open for another request.
+    private func respond(_ client: Client, head: String,
+                         done: @escaping (_ keepAlive: Bool) -> Void) {
+        let conn = client.conn
+        let lines = head.components(separatedBy: "\r\n")
+        let requestLine = lines.first ?? ""
+        let method = requestLine.split(separator: " ").first.map(String.init) ?? ""
+        func header(_ name: String) -> String? {
+            let prefix = name.lowercased() + ":"
+            return lines.dropFirst()
+                .first { $0.lowercased().hasPrefix(prefix) }
+                .map { $0.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces) }
         }
-        head += "Content-Length: \(length)\r\n"
-        head += "Connection: close\r\n"
-        head += "\r\n"
+        // HTTP/1.1 is persistent unless the client opts out; 1.0 only if it opts in.
+        let connectionHeader = header("connection")?.lowercased() ?? ""
+        let keepAlive = requestLine.hasSuffix("HTTP/1.1")
+            ? !connectionHeader.contains("close")
+            : connectionHeader.contains("keep-alive")
 
-        conn.send(content: head.data(using: .utf8), completion: .contentProcessed { _ in
-            self.streamBody(conn, start: start, length: length)
+        let status: String
+        var extra: [String] = []
+        var start: UInt64 = 0
+        var length: UInt64 = 0
+
+        if method != "GET" && method != "HEAD" {
+            status = "405 Method Not Allowed"
+            extra.append("Allow: GET, HEAD")
+        } else {
+            switch parseRange(header("range")) {
+            case .full:
+                status = "200 OK"
+                length = size
+            case .partial(let s, let e):
+                status = "206 Partial Content"
+                extra.append("Content-Range: bytes \(s)-\(e)/\(size)")
+                start = s
+                length = e - s + 1
+            case .unsatisfiable:
+                status = "416 Range Not Satisfiable"
+                extra.append("Content-Range: bytes */\(size)")
+            }
+        }
+        dbg("http #\(client.id) \(requestLine) range=\(header("range") ?? "none") -> \(status), \(length) bytes")
+        dbg("http #\(client.id)   headers: \(lines.dropFirst().joined(separator: " | "))")
+
+        var response = "HTTP/1.1 \(status)\r\n"
+        response += "Content-Type: video/mp4\r\n"
+        response += "Accept-Ranges: bytes\r\n"
+        for line in extra { response += line + "\r\n" }
+        response += "Content-Length: \(length)\r\n"
+        response += "Connection: \(keepAlive ? "keep-alive" : "close")\r\n"
+        response += "\r\n"
+
+        conn.send(content: Data(response.utf8), completion: .contentProcessed { error in
+            guard error == nil else { conn.cancel(); return }
+            guard method == "GET", length > 0 else { done(keepAlive); return }
+            self.streamBody(client, start: start, length: length) { finished in
+                if finished { done(keepAlive) } else { conn.cancel() }
+            }
         })
     }
 
-    private func streamBody(_ conn: NWConnection, start: UInt64, length: UInt64) {
-        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { conn.cancel(); return }
-        try? handle.seek(toOffset: start)
-        let chunkSize: UInt64 = 1_048_576 // 1 MB
+    /// Stream `length` bytes of the file from `start`. `done(false)` means the body didn't go
+    /// out in full and the connection must be dropped.
+    private func streamBody(_ client: Client, start: UInt64, length: UInt64,
+                            done: @escaping (_ finished: Bool) -> Void) {
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { done(false); return }
+        do { try handle.seek(toOffset: start) } catch { try? handle.close(); done(false); return }
+        let began = Date()
+        func progress(_ sent: UInt64) -> String {
+            String(format: "%.1f of %.1f MB in %.1fs", Double(sent) / 1e6, Double(length) / 1e6,
+                   Date().timeIntervalSince(began))
+        }
+        var nextReport = Self.reportEvery
 
-        func sendNext(remaining: UInt64) {
-            if remaining == 0 {
+        func sendNext(sent: UInt64) {
+            if sent == length {
                 try? handle.close()
-                conn.send(content: nil, completion: .contentProcessed { _ in conn.cancel() })
+                if length >= Self.reportEvery { dbg("http #\(client.id) body done: \(progress(sent))") }
+                done(true)
                 return
             }
-            let n = Int(min(chunkSize, remaining))
-            let data = handle.readData(ofLength: n)
-            if data.isEmpty {
+            let n = Int(min(UInt64(Self.chunkSize), length - sent))
+            guard let data = try? handle.read(upToCount: n), !data.isEmpty else {
                 try? handle.close()
-                conn.cancel()
+                dbg("http #\(client.id) file read failed after \(progress(sent))")
+                done(false)
                 return
             }
-            conn.send(content: data, completion: .contentProcessed { _ in
-                sendNext(remaining: remaining - UInt64(data.count))
+            client.conn.send(content: data, completion: .contentProcessed { error in
+                // Receivers hang up mid-range all the time (seeking, buffer full). Stop there
+                // rather than reading the rest of the file into a dead socket.
+                if let error {
+                    try? handle.close()
+                    dbg("http #\(client.id) send stopped after \(progress(sent)): \(error)")
+                    done(false)
+                    return
+                }
+                let total = sent + UInt64(data.count)
+                if total >= nextReport, total < length {
+                    dbg("http #\(client.id) sending: \(progress(total))")
+                    nextReport += Self.reportEvery
+                }
+                sendNext(sent: total)
             })
         }
-        sendNext(remaining: length)
+        sendNext(sent: 0)
     }
 
     // MARK: - Range parsing
 
-    private func parseRange(in request: String) -> (UInt64, UInt64)? {
-        // Split on the HTTP line terminator and isolate the Range header. Do NOT scan
-        // Characters for "\r"/"\n": Swift treats a CRLF as a single grapheme cluster, so
-        // `ch == "\r"` never matches and the scan swallows every following header into the
-        // spec. That made the server return the whole file for `bytes=0-1` probes, which
-        // AVFoundation rejects as "server is not correctly configured" (-12939) — the item
-        // then fails (slashed-out play button) and there's nothing valid to hand the TV.
-        let lines = request.components(separatedBy: "\r\n")
-        guard let rangeLine = lines.first(where: { $0.range(of: "range:", options: .caseInsensitive) != nil }),
-              let eq = rangeLine.range(of: "bytes=", options: .caseInsensitive) else { return nil }
-        let spec = rangeLine[eq.upperBound...].trimmingCharacters(in: .whitespaces)
-        let parts = spec.split(separator: "-", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard let s = parts.first, let start = UInt64(s) else { return nil }
-        let endVal: UInt64
-        if parts.count > 1, let e = UInt64(parts[1]), e >= start {
-            endVal = e
-        } else {
-            endVal = size > 0 ? size - 1 : 0
-        }
-        return (start, min(endVal, size > 0 ? size - 1 : 0))
+    private enum ByteRange: Equatable {
+        case full
+        case partial(UInt64, UInt64)   // inclusive start...end
+        case unsatisfiable
     }
 
-    private func resolve(range: (UInt64, UInt64)?) -> (UInt64, UInt64, String) {
-        guard let (s, e) = range else {
-            return (0, size > 0 ? size - 1 : 0, "200 OK")
+    /// Parse a `Range` header value (RFC 9110 §14.1.2) against the file size.
+    ///
+    /// Header lines are isolated by splitting on CRLF in `respond`. Do NOT scan Characters
+    /// for "\r"/"\n": Swift treats a CRLF as a single grapheme cluster, so `ch == "\r"` never
+    /// matches. That bug made the server return the whole file for `bytes=0-1` probes, which
+    /// AVFoundation rejects as "server is not correctly configured" (-12939).
+    private func parseRange(_ value: String?) -> ByteRange {
+        guard let value,
+              let eq = value.range(of: "bytes=", options: [.caseInsensitive, .anchored]) else { return .full }
+        let spec = value[eq.upperBound...].trimmingCharacters(in: .whitespaces)
+        // Multi-range requests would need a multipart/byteranges body; ignoring the header
+        // and sending the whole file is the RFC-sanctioned alternative.
+        guard !spec.contains(",") else { return .full }
+        let parts = spec.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 2 else { return .full }
+
+        if parts[0].isEmpty {
+            // Suffix range: the last N bytes.
+            guard let n = UInt64(parts[1]) else { return .full }
+            guard n > 0, size > 0 else { return .unsatisfiable }
+            return .partial(size - min(n, size), size - 1)
         }
-        return (s, e, "206 Partial Content")
+        guard let start = UInt64(parts[0]) else { return .full }
+        guard start < size else { return .unsatisfiable }
+        if parts[1].isEmpty { return .partial(start, size - 1) }
+        guard let end = UInt64(parts[1]), end >= start else { return .full }
+        return .partial(start, min(end, size - 1))
     }
 
     // MARK: - LAN IP

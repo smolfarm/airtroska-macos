@@ -26,6 +26,13 @@ For AirPlay to a third-party receiver (e.g. a Roku TV) that can't be handed a
 `file://` URL, Airtroska runs a tiny local HTTP server with byte-range support
 and gives AVPlayer the `http://` LAN URL instead.
 
+Some of those TVs (Vizio, for one) also stretch any video that isn't 16:9 to
+fill the screen, and macOS has no API to tell them otherwise. So by default
+Airtroska **letterboxes non-16:9 video to 16:9** (black bars baked in), which
+means re-encoding it. HDR video is exempt, since an 8-bit re-encode would wash
+out its colours. Turn it off in Settings → Conversion if you only AirPlay to an
+Apple TV, which letterboxes by itself.
+
 ## Requirements
 
 - macOS 13+
