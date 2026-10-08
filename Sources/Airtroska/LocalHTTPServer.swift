@@ -205,7 +205,8 @@ final class LocalHTTPServer {
                 extra.append("Content-Range: bytes */\(size)")
             }
         }
-        dbg("http #\(client.id) \(requestLine) range=\(header("range") ?? "none") -> \(status), \(length) bytes")
+        dbg("http #\(client.id) \(requestLine) range=\(header("range") ?? "none") -> \(status), \(length) bytes"
+            + extra.map { " | \($0)" }.joined())
         dbg("http #\(client.id)   headers: \(lines.dropFirst().joined(separator: " | "))")
 
         var response = "HTTP/1.1 \(status)\r\n"
@@ -305,6 +306,8 @@ final class LocalHTTPServer {
         }
         guard let start = UInt64(parts[0]) else { return .full }
         guard start < size else { return .unsatisfiable }
+        // Open-ended ranges must run to the end of the file: a Vizio TV treats the end of a
+        // shorter 206 as the end of the video and stops there.
         if parts[1].isEmpty { return .partial(start, size - 1) }
         guard let end = UInt64(parts[1]), end >= start else { return .full }
         return .partial(start, min(end, size - 1))
